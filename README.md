@@ -1,8 +1,16 @@
 # Stream Cutter
 
 Drop in your stream VODs or clips, name the project, click **Build rough cut**.
-It listens for the loud, reactive moments (yelling, laughing, big plays), skips dead air,
-and renders a rough cut plus an edit list you can open in Resolve or Premiere.
+It tracks two things across your footage and keeps the moments where either one spikes:
+- **Audio:** yelling, laughing, big reactions (loud compared with the surrounding minute)
+- **Visual:** sudden big movement or screen changes (explosions, glitches, flashes, chaos)
+
+It skips dead air and frozen screens (loading, AFK), then renders a rough cut plus an edit list
+you can open in Resolve or Premiere. The timeline in the app shows both signals and what was kept,
+and updates live as you move the sliders.
+
+Visual tracking sees *change*, not meaning: a menu popping open can score like a gag.
+Review `rough_cut_<date>_cuts.txt` and trim in your editor.
 
 ## Get the app (no Python needed)
 1. Open the **Actions** tab on GitHub, pick the latest run of the branch you want.

@@ -1,11 +1,13 @@
-"""Stream Cutter engine: audio analysis, moment picking, rendering. No GUI code in here."""
+"""Stream Cutter engine: audio + video analysis, moment picking, rendering. No GUI code in here."""
 import hashlib, json, os, shutil, subprocess, time, urllib.request, zipfile
 from pathlib import Path
 import numpy as np
 
-SR, WIN = 16000, 0.5          # audio sample rate, seconds per analysis window
+SR, WIN = 16000, 0.5          # audio sample rate, seconds per analysis window (audio and video share it)
+VW, VH = 64, 36               # video frames are shrunk to this size for motion tracking
 W, H, FPS = 1920, 1080, 60    # format of the rendered rough cut
 CLIP_KEEP_ALL = 90            # files shorter than this (sec) are treated as pre-picked clips and kept whole
+MIN_SCORE = 1.5               # a moment must stand out by at least this many "sigmas" to be kept
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".flv", ".ts", ".webm", ".avi", ".m4v"}
 NOWIN = 0x08000000 if os.name == "nt" else 0
 ROOT = Path.home() / "Videos" / "StreamCutter"
@@ -97,50 +99,138 @@ def loudness(path, track, dur, on_frac, cancel):
     return np.concatenate(out) if out else np.zeros(0)
 
 
-def pick(db, target, pre, post, gap=5.0, min_len=6.0):
-    """Moments that are loud relative to the surrounding minute (yelling, laughing, reactions),
-    never dead air. The threshold is tuned so the result is at most `target`% of the footage."""
-    dur = len(db) * WIN
+def watch(path, dur, on_frac, cancel):
+    """Motion per WIN-second window: how much the picture changed since the previous sample.
+    Frames are shrunk to 64x36 grey, so big or sudden changes stand out and a frozen screen reads ~0."""
+    fsz = VW * VH
+    for hw in (["-hwaccel", "auto"], []):          # try GPU decoding first, fall back to CPU
+        cmd = ["ffmpeg", "-v", "error", *hw, "-i", str(path), "-an", "-sn", "-vf",
+               f"fps={1 / WIN:g},scale={VW}:{VH}:flags=fast_bilinear,format=gray", "-f", "rawvideo", "-"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, creationflags=NOWIN)
+        out, buf, prev, done = [], b"", None, 0
+        try:
+            while chunk := p.stdout.read(fsz * 120):
+                if cancel.is_set():
+                    raise Cancelled()
+                buf += chunk
+                k = len(buf) // fsz
+                if k:
+                    x = np.frombuffer(buf[: k * fsz], np.uint8).reshape(k, fsz).astype(np.float32)
+                    buf = buf[k * fsz:]
+                    d = np.abs(np.diff(x if prev is None else np.vstack([prev, x]), axis=0)).mean(1)
+                    out.append(np.concatenate([[0.0], d]) if prev is None else d)
+                    prev = x[-1:]
+                    done += k
+                    on_frac(min(1.0, done * WIN / dur))
+        finally:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+        if out:
+            return np.concatenate(out)
+    return np.zeros(0)
+
+
+def _avg(x, k):
+    """Moving average that stays honest at the start and end of the file (no zero-padding bias)."""
+    ones = np.ones(k)
+    return np.convolve(x, ones, "same") / np.convolve(np.ones(len(x)), ones, "same")
+
+
+def _excess(x, live, floor_sigma):
+    """How far each window sits above its local norm (the surrounding minute), in 'sigmas'.
+    Dead windows (silence / frozen picture) score -99 and never drag the norm around."""
+    if not live.any():
+        return np.full(len(x), -99.0)
+    flat = np.where(live, x, np.median(x[live]))
+    e = _avg(flat - _avg(flat, 120), 3)
+    sig = max(1.4826 * np.median(np.abs(e[live] - np.median(e[live]))), floor_sigma)
+    return np.where(live, e / sig, -99.0)
+
+
+def scores(db, vis=None):
+    """(audio, visual) excitement per window. visual is None when the video was not scanned."""
+    n = len(db) if vis is None or not len(vis) else min(len(db), len(vis))
+    db = db[:n]
+    sa = _excess(db, db > np.percentile(db, 10) + 6, 2.0)
+    sv = None
+    if vis is not None and len(vis):
+        v = vis[:n]
+        sv = _excess(np.log1p(v), v > 0.5, 0.4)
+    return sa, sv
+
+
+def pick(sc, balance, target, pre, post, gap=5.0, min_len=6.0):
+    """Choose moments as (start, end, kind) with kind 'a' (audio), 'v' (visual) or 'av' (both).
+    balance 0 = audio only ... 1 = visual only; 0.5 takes either kind. The threshold is tuned so
+    the result is at most `target`% of the footage."""
+    sa, sv = sc
+    n = len(sa)
+    dur = n * WIN
     if dur < CLIP_KEEP_ALL:
-        return [(0.0, dur)] if dur else []
-    live = db > np.percentile(db, 10) + 6
+        return [(0.0, dur, "a")] if dur else []
+    wa, wv = (1.0, 0.0) if sv is None else (min(1.0, 2 * (1 - balance)), min(1.0, 2 * balance))
+    A = np.where(sa > -98, wa * sa, -99.0) if wa else np.full(n, -99.0)
+    V = np.where(sv > -98, wv * sv, -99.0) if wv else np.full(n, -99.0)
+    score = np.maximum(A, V)
+    live = score > -98
     if not live.any():
         return []
-    flat = np.where(live, db, np.median(db[live]))      # dead air must not drag the baseline down
-    score = np.convolve(flat - np.convolve(flat, np.ones(120) / 120, "same"), np.ones(3) / 3, "same")
-    score = np.where(live, score, -99.0)
 
     def cut(pct):
-        thr = max(np.percentile(score[live], 100 - pct), 3.0)   # at least 3 dB above the local norm
+        thr = max(np.percentile(score[live], 100 - pct), MIN_SCORE)
         segs = []
         for i in np.flatnonzero(score >= thr):
-            s, e = i * WIN - pre, (i + 1) * WIN + post
+            s, e, ah, vh = i * WIN - pre, (i + 1) * WIN + post, A[i] >= thr, V[i] >= thr
             if segs and s - segs[-1][1] <= gap:
-                segs[-1][1] = max(segs[-1][1], e)
+                seg = segs[-1]
+                seg[1], seg[2], seg[3] = max(seg[1], e), seg[2] or ah, seg[3] or vh
             else:
-                segs.append([s, e])
-        return [(max(0.0, s), min(dur, e)) for s, e in segs if e - s >= min_len]
+                segs.append([s, e, ah, vh])
+        return [(max(0.0, s), min(dur, e), "av" if ah and vh else "a" if ah else "v")
+                for s, e, ah, vh in segs if e - s >= min_len]
 
     lo, hi, best = 0.5, 100.0, []
     for _ in range(8):
         mid = (lo + hi) / 2
         segs = cut(mid)
-        if sum(e - s for s, e in segs) <= target / 100 * dur:
+        if sum(e - s for s, e, _ in segs) <= target / 100 * dur:
             lo, best = mid, segs
         else:
             hi = mid
     return best
 
 
+# ---------- cache ----------
+def cache_paths(proj, f, track):
+    k = hashlib.md5(f"{f}{os.path.getmtime(f)}".encode()).hexdigest()[:10]
+    return proj / "cache" / f"{k}_a{track}.npy", proj / "cache" / f"{k}_v.npy"
+
+
+def cached(proj, f, track, visual):
+    """(audio, visual-or-None) from an earlier analysis, or None if it was never analyzed."""
+    try:
+        a, v = cache_paths(proj, f, track)
+        if not a.exists() or (visual and not v.exists()):
+            return None
+        return np.load(a), (np.load(v) if visual else None)
+    except OSError:
+        return None
+
+
 # ---------- full pipeline ----------
 def build(proj, files, cfg, emit, cancel):
     """Runs everything and reports through emit(tuple). Events:
-    stage(i, run|done), prog(0-1), sub(0-1, text), file(path, col, text), segs(list), done(dict)."""
-    out, cache = proj / "output", proj / "cache"
-    tmp = out / "_tmp"
-    cache.mkdir(parents=True, exist_ok=True)
+    stage(i, run|done), prog(0-1), sub(0-1, text), file(path, col, text), dur(path, sec),
+    analysis(path, audio, visual), done(dict)."""
+    out, tmp = proj / "output", proj / "output" / "_tmp"
+    (proj / "cache").mkdir(parents=True, exist_ok=True)
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
+    vis_on = cfg["visual"]
+    L, V = (0.15, 0.30) if vis_on else (0.30, 0.0)      # share of the progress bar for each stage
+    P = L + V + 0.02
 
     def chk():
         if cancel.is_set():
@@ -154,6 +244,7 @@ def build(proj, files, cfg, emit, cancel):
             except Exception:
                 raise RuntimeError(f"Couldn't read {Path(f).name}. Is it a valid video file?")
             emit(("file", f, "len", mmss(info[f][0])))
+            emit(("dur", f, info[f][0]))
         total = sum(d for d, _ in info.values()) or 1
 
         # 1. listen
@@ -162,46 +253,72 @@ def build(proj, files, cfg, emit, cancel):
         for f in files:
             chk()
             dur, name = info[f][0], Path(f).name
-            npy = cache / (hashlib.md5(f"{f}{os.path.getmtime(f)}{cfg['track']}".encode()).hexdigest()[:10] + ".npy")
+            apath = cache_paths(proj, f, cfg["track"])[0]
 
             def frac(x):
-                emit(("prog", 0.35 * (base + x * dur) / total))
+                emit(("prog", L * (base + x * dur) / total))
                 emit(("sub", x, f"Listening to {name}  ·  {x * 100:.0f}%"))
                 emit(("file", f, "status", f"Listening {x * 100:.0f}%"))
 
-            if npy.exists():
-                db = np.load(npy)
+            if apath.exists():
+                db = np.load(apath)
                 frac(1)
             else:
                 db = loudness(f, cfg["track"], dur, frac, cancel)
                 if not len(db) and cfg["track"]:
                     db = loudness(f, 0, dur, frac, cancel)
-                np.save(npy, db)
+                if len(db):
+                    np.save(apath, db)
             dbs[f] = db
             base += dur
         emit(("stage", 0, "done"))
 
-        # 2. pick
+        # 2. watch
         emit(("stage", 1, "run"))
-        cuts, view = [], []
+        viss, base = {}, 0.0
+        if vis_on:
+            for f in files:
+                chk()
+                dur, name = info[f][0], Path(f).name
+                vpath = cache_paths(proj, f, cfg["track"])[1]
+
+                def frac(x):
+                    emit(("prog", L + V * (base + x * dur) / total))
+                    emit(("sub", x, f"Watching {name}  ·  {x * 100:.0f}%"))
+                    emit(("file", f, "status", f"Watching {x * 100:.0f}%"))
+
+                if vpath.exists():
+                    v = np.load(vpath)
+                    frac(1)
+                else:
+                    v = watch(f, dur, frac, cancel)
+                    if len(v):
+                        np.save(vpath, v)
+                viss[f] = v if len(v) else None
+                base += dur
+        emit(("stage", 1, "done"))
+
+        # 3. pick
+        emit(("stage", 2, "run"))
+        cuts = []
         for f in files:
             db = dbs[f]
             if not len(db):
                 emit(("file", f, "status", "No audio"))
                 continue
-            segs = pick(db, cfg["target"], cfg["pre"], cfg["post"])
+            emit(("analysis", f, db, viss.get(f)))
+            segs = pick(scores(db, viss.get(f)), cfg["balance"], cfg["target"], cfg["pre"], cfg["post"])
             emit(("file", f, "status", f"{len(segs)} moments"))
-            emit(("file", f, "kept", mmss(sum(e - s for s, e in segs))))
-            view.append((len(db) * WIN, segs))
-            cuts += [(f, s, e) for s, e in segs]
-        emit(("segs", view))
-        emit(("prog", 0.37))
-        emit(("stage", 1, "done"))
+            emit(("file", f, "kept", mmss(sum(e - s for s, e, _ in segs))))
+            cuts += [(f, s, e) for s, e, _ in segs]
+        emit(("prog", P))
+        emit(("stage", 2, "done"))
         if not cuts:
-            raise RuntimeError("No good moments found. Try raising Max length, or pick a different audio track.")
+            raise RuntimeError("No good moments found. Try moving 'How much to keep' up, turning on "
+                               "'Watch the video too', or choosing a different audio track.")
 
-        # 3. render
-        emit(("stage", 2, "run"))
+        # 4. render
+        emit(("stage", 3, "run"))
         vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
               f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={FPS},format=yuv420p")
         enc = (["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21"] if cfg["gpu"]
@@ -210,17 +327,17 @@ def build(proj, files, cfg, emit, cancel):
         for i, (f, s, e) in enumerate(cuts):
             chk()
             emit(("sub", done / tot, f"Rendering clip {i + 1} of {len(cuts)}"))
-            emit(("prog", 0.37 + 0.58 * done / tot))
+            emit(("prog", P + (0.95 - P) * done / tot))
             p = tmp / f"{i:04d}.mp4"
             ff(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-i", f, "-t", f"{e - s:.2f}",
                 "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf, *enc,
                 "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", str(p)])
             done += e - s
             parts.append(p)
-        emit(("stage", 2, "done"))
+        emit(("stage", 3, "done"))
 
-        # 4. export
-        emit(("stage", 3, "run"))
+        # 5. export
+        emit(("stage", 4, "run"))
         emit(("sub", 0.5, "Joining clips and writing edit files"))
         stem = "rough_cut_" + time.strftime("%Y%m%d_%H%M")
         (out / f"{stem}_cuts.txt").write_text(
@@ -238,7 +355,7 @@ def build(proj, files, cfg, emit, cancel):
         lst.write_text("".join("file '" + q.as_posix().replace("'", "'\\''") + "'\n" for q in parts), encoding="utf-8")
         final = out / f"{stem}.mp4"
         ff(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(final)])
-        emit(("stage", 3, "done"))
+        emit(("stage", 4, "done"))
         emit(("prog", 1.0))
         emit(("sub", 1.0, "Finished"))
         emit(("done", dict(video=final, folder=out, moments=len(cuts), kept=tot, src=total)))
