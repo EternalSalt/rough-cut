@@ -21,11 +21,21 @@ The panel on the right shows what it chose. **Fine-tune** is there if you want t
 - Opens with a 10-second teaser of the best moment (cold open)
 - Optional trimming of dead stretches between peaks, soft audio fades on every cut, volume leveled to about
   -14 LUFS (YouTube's usual target)
-- **AI director (optional):** with your own Anthropic API key it rates the candidate moments from their
-  transcripts, drops the weak ones, picks the teaser, and writes chapter titles. It sends short transcript
-  excerpts to Anthropic and uses your API credit. The key is stored in plain text in
-  `%LOCALAPPDATA%\StreamCutter\config.json`; empty the key box and build to forget it. If the director fails for
-  any reason the automatic picks are used instead.
+- **AI director (optional, free):** a language model running **on your own PC** rates the candidate moments from
+  their transcripts, drops the weak ones, picks the teaser and writes chapter titles. No account, no API key, no
+  cost, and nothing leaves your computer.
+  - It uses **Ollama** (ollama.com), or llama.cpp's `llama-server`, or LM Studio, whichever is running. It finds
+    them by itself (Ollama on port 11434, llama.cpp on 8080, LM Studio on 1234).
+  - **Model choice is automatic**: an installed model of about 3 to 8 billion parameters. Embedding models are
+    skipped, and so are Ollama "cloud" models, because those run on Ollama's servers, not your PC. You can pick one
+    in Fine-tune.
+  - If Ollama is running but has no model, it asks before downloading a small one (about 2.5 GB, once).
+  - It needs speech reading, and it is slow on a CPU (minutes, not seconds). If anything goes wrong it carries on
+    with the automatic picks and tells you why.
+  - Optional: choose "Claude API" instead if you have your own key (paid). The key is stored in plain text in
+    `%LOCALAPPDATA%\StreamCutter\config.json`; empty the box and build to forget it.
+- **Chapters without any AI:** moments with a clearly reactive phrase get a free chapter title from your own words
+  (swearing masked); ordinary chatter is left unnamed.
 
 ## What it does not do
 - It sees loudness, screen change and keywords, not true meaning. A menu popping open can score like a gag, and
@@ -63,7 +73,7 @@ git tag v0.5.0 && git push --tags      # publish a release build
 - `rough_cut_<date>.mp4`            the cut (a new file every run, nothing overwritten)
 - `rough_cut_<date>.edl`            the same cuts as an edit list
 - `rough_cut_<date>_cuts.txt`       timestamps of every cut ([cold open] marks the teaser)
-- `rough_cut_<date>_chapters.txt`   YouTube chapters (only when the AI director wrote titles)
+- `rough_cut_<date>_chapters.txt`   YouTube chapters for the description (needs speech reading)
 
 ## Repo layout check
 After pushing, the **top level** of the repo on GitHub must show `.github`, `stream_cutter`, `main.py` and
